@@ -1,0 +1,111 @@
+{
+  "appVersion": "1.0.7",
+  "gitHash": "be292848919a4645b7f45aa6c077d37b800257ff",
+  "createTime": 1793608220991,
+  "lastTime": 1793608220991,
+  "version": 6,
+  "name": "ciallo~",
+  "platform": "EIDE",
+  "vendor": "Puya",
+  "serial": "PY32F002B",
+  "series": "PY32F002B",
+  "chip": "PY32F002BF15P6",
+  "firmversion": "V1.2.1",
+  "frameWork": "cortex-m0+",
+  "minstack": "0x200",
+  "minheap": "0x100",
+  "ramSize": "0xC00",
+  "flashSize": "0x6000",
+  "default_firmware_location": true,
+  "custom_firmware_location": "",
+  "library_copy": "all",
+  "data": {
+    "lastTime": 1793608665911,
+    "version": 6,
+    "gpioBindings": {
+      "version": 1,
+      "rows": [
+        {
+          "pinName": "PA0",
+          "locked": false,
+          "source": "auto",
+          "alternates": [
+            "TIM1_CH1"
+          ],
+          "primarySignal": "TIM1_CH1"
+        },
+        {
+          "pinName": "PA1",
+          "locked": false,
+          "source": "auto",
+          "alternates": [
+            "TIM1_CH2"
+          ],
+          "primarySignal": "TIM1_CH2"
+        },
+        {
+          "pinName": "PA2",
+          "locked": true,
+          "source": "manual",
+          "alternates": [
+            "SWCLK"
+          ],
+          "primarySignal": "SWCLK"
+        },
+        {
+          "pinName": "PB3",
+          "locked": false,
+          "source": "auto",
+          "alternates": [
+            "I2C1_SCL"
+          ],
+          "primarySignal": "I2C1_SCL"
+        },
+        {
+          "pinName": "PB4",
+          "locked": false,
+          "source": "auto",
+          "alternates": [
+            "I2C1_SDA"
+          ],
+          "primarySignal": "I2C1_SDA"
+        },
+        {
+          "pinName": "PB6",
+          "locked": true,
+          "source": "manual",
+          "alternates": [
+            "SWDIO"
+          ],
+          "primarySignal": "SWDIO"
+        }
+      ]
+    },
+    "value": {
+      "I2C1.MODE.Mode.value": {
+        "type": "global-value",
+        "order": 5,
+        "value": "I2C"
+      },
+      "TIM1.MODE.Channel1.value": {
+        "type": "global-value",
+        "order": 2,
+        "value": "pwm_ch"
+      },
+      "TIM1.MODE.Channel2.value": {
+        "type": "global-value",
+        "order": 3,
+        "value": "pwm_ch"
+      },
+      "PA2;SWCLK": {
+        "type": "pins-af",
+        "order": 4
+      },
+      "PB6;SWDIO": {
+        "type": "pins-af",
+        "order": 6
+      }
+    }
+  },
+  "templateVersion": 3
+}
