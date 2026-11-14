@@ -58,13 +58,18 @@
 /* Private typedef -----------------------------------------------------------*/
 typedef struct
 {
-  float    pitch_deg;      /* 俯仰角（互补滤波后） */
-  float    pitch_ref;      /* 上电时的俯仰角，作为零点 */
+  float    pitch_deg;      /* 俯仰角（互补滤波后，绝对倾角，用于求角速度/增量） */
+  float    pitch_prev;     /* 上一帧的 pitch_deg，用来取增量 */
+  float    pitch_tr;       /* 点头"瞬态量"：把增量累积起来再泄漏，驱动 CH1 */
+  float    pitch_ref;      /* 上电时的俯仰角（标定/诊断用，不参与动作输出） */
   float    yaw_deg;        /* 转头角（漏积分） */
   float    pitch_rate;     /* deg/s */
   float    yaw_rate;       /* deg/s */
   float    out1;           /* CH1 当前脉宽（浮点便于做斜率限制） */
   float    out2;           /* CH2 当前脉宽 */
+  float    vel1;           /* CH1 当前速度（us/帧），加速度限制用 */
+  float    vel2;           /* CH2 当前速度 */
+  uint16_t up_frames;      /* 上电后的控制帧数，软启动按它爬坡 */
   int16_t  gyro_bias[3];   /* 零偏，单位 LSB */
   uint32_t tick;           /* 上次采样时刻 */
   uint32_t retry_tick;     /* 上次重连尝试时刻 */
@@ -82,6 +87,27 @@ typedef struct
 
 /* Private variables ---------------------------------------------------------*/
 static EarCtx_t s_ear;
+
+/* 实时姿态镜像：只有 24 字节，专门给 SWD 观察用。
+ *
+ * 为什么单独开一份而不是让 PC 直接读 s_ear：s_ear 是 static 且非 volatile，
+ * 开 -Os + LTO 之后编译器会把它的字段拆成独立的标量（甚至直接放进寄存器），
+ * 符号可能整个消失，PC 端按名字找不到。这份是 volatile 的，符号一定在。
+ *
+ * PC 端用法：tools/pose_watch.py（读 ELF 里的 g_ear_pose，每 50ms 打印一行）。
+ * 转头时 yaw_deg 不动 -> 问题在传感器轴；yaw_deg 在涨但 out2 不动 -> 问题在算法。 */
+typedef struct
+{
+  float pitch_tr;      /* 点头瞬态量（度） */
+  float yaw_deg;       /* 转头积分角（度） */
+  float pitch_rate;    /* deg/s */
+  float yaw_rate;      /* deg/s */
+  float out1;          /* CH1 实际脉宽 */
+  float out2;          /* CH2 实际脉宽 */
+} EarPoseMirror_t;
+
+_Static_assert(sizeof(EarPoseMirror_t) == 24U, "Update tools/pose_watch.py layout");
+volatile EarPoseMirror_t g_ear_pose;
 
 /* 指令延迟线：长度覆盖 300ms，够任何合理的延迟设置；
  * 两个通道共用写指针，各读各的位置，省一半索引管理。
@@ -113,9 +139,11 @@ static SyncGate_t s_sync_nod;
 #endif
 #endif /* 有轴在用 AFTER_MOVE */
 
-/* 点头的弹簧状态（位置/速度），单位都是归一化量 */
+#if (EAR_ACTION_MODE == EAR_ACTION_TRACK)
+/* 点头的弹簧状态（位置/速度），单位都是归一化量。只有"跟随"模式才用得到 */
 static float   s_spr_pos;
 static float   s_spr_vel;
+#endif
 
 /* 常驻诊断，只记录现场、不额外访问传感器。PC 端按当前 ELF 符号读取，
  * 不使用未预留的固定 RAM 地址。每条总线各留一份，避免软件重试覆盖硬件现场。 */
@@ -183,19 +211,36 @@ static uint8_t  IMU_ReadSample(float *ax, float *ay, float *az,
                                float *gx, float *gy, float *gz);
 static float    ClampF(float v, float lo, float hi);
 static uint16_t ClampUs(float us);
+#if (EAR_ACTION_MODE == EAR_ACTION_TRACK)
 static float    ShapeNorm(float angle, float deadband, float full);
+#endif
 static void     Servo_Apply(float us1, float us2);
 static void     Servo_RampTo(uint16_t us1, uint16_t us2, uint8_t steps);
+#if (EAR_ACTION_MODE == EAR_ACTION_TRACK)
+static void     Servo_Slew(float *pos, float *vel, float target, float cap);
+#endif
+static float    SlewCap(void);
 static void     Ear_Update(float dt);
 static void     Ear_Output(void);
 static void     Ear_BeaconSwing(uint16_t half_swings);
 static void     Ear_DelayUs(uint16_t us);
 
 /*==============================================================================
+ *  时序敏感的忙等函数：把机器码钉死，别让优化等级改总线速度
+ *
+ * 下面三个循环的"每次迭代几周期"直接决定 I2C 比特率和各路延时的长度。
+ * 一旦换优化等级（-Og -> -Os 或开 LTO），GCC 会把循环体重排成一半的指令，
+ * 软件 I2C 就凭空快一倍——这颗传感器对时序很敏感，不能让它悄悄变。
+ * optimize("Og") + noinline 把这三个函数按调试等级单独编译，
+ * 于是整个工程可以放心开 -Os / -flto，而总线时序和换优化之前逐条指令相同。
+ *============================================================================*/
+#define EAR_TIMING_FIXED   __attribute__((noinline, optimize("Og")))
+
+/*==============================================================================
  *  软件模拟 I2C（开漏输出 + 内部上拉，可从 IDR 回读电平）
  *  外部仍需 4.7k 上拉，常见的 GY 模块板子自带
  *============================================================================*/
-static void I2C_Delay(void)
+EAR_TIMING_FIXED static void I2C_Delay(void)
 {
   volatile uint8_t i;
   for (i = 0U; i < EAR_I2C_DELAY_LOOPS; i++)
@@ -217,7 +262,7 @@ static void Wdg_Kick(void)
   IWDG->KR = 0xAAAAU;
 }
 
-static void Ear_DelayMs(uint32_t ms)
+EAR_TIMING_FIXED static void Ear_DelayMs(uint32_t ms)
 {
   volatile uint32_t i;
   /* 内层循环实测约 12 个周期/次（-Og 下 ldr/add/str/ldr/cmp/bcc 各占几条），
@@ -1020,6 +1065,8 @@ static uint8_t IMU_Calibrate(void)
                       az_sum / (float)ok) * RAD_TO_DEG;
 
     s_ear.pitch_deg = a0;
+    s_ear.pitch_prev = a0;      /* 增量基准，避免重连第一帧算出巨大跳变 */
+    s_ear.pitch_tr   = 0.0f;    /* 重连从"耳朵在中位"开始，不要接着上次的偏摆 */
 
     if (s_ear.ref_valid == 0U)
     {
@@ -1165,7 +1212,15 @@ static uint16_t ClampUs(float us)
   return (uint16_t)(us + 0.5f);
 }
 
-/* 角度 -> [-1,1]：中间留死区抑制静止抖动，两端 smoothstep 软化，动作不生硬 */
+#if (EAR_ACTION_MODE == EAR_ACTION_TRACK)
+/* 角度 -> [-1,1]：中间留死区抑制静止抖动，两端软化，动作不生硬
+ *
+ * 曲线 = K·a + (1-K)·a²(3-2a)
+ *   线性项负责"小角度也有明确反应"，smoothstep 项负责"两端不生硬"。
+ * 纯 smoothstep 在零点附近是二次的，10 度转头只出 10% 行程，
+ * 这是之前"转头不灵敏"的主要来源之一。
+ *
+ * 事件抖动模式不看角度，只由陀螺角速度触发，所以这个函数只在跟随模式编译。 */
 static float ShapeNorm(float angle, float deadband, float full)
 {
   float a = fabsf(angle);
@@ -1180,9 +1235,11 @@ static float ShapeNorm(float angle, float deadband, float full)
   {
     a = 1.0f;
   }
-  y = a * a * (3.0f - 2.0f * a);
+  y = (EAR_SHAPE_LINEAR * a)
+    + ((1.0f - EAR_SHAPE_LINEAR) * (a * a * (3.0f - (2.0f * a))));
   return (angle < 0.0f) ? -y : y;
 }
+#endif
 
 /*==============================================================================
  *  舵机输出
@@ -1212,7 +1269,79 @@ static void Servo_RampTo(uint16_t us1, uint16_t us2, uint8_t steps)
                 (float)start2 + ((float)us2 - (float)start2) * k);
     Ear_DelayMs(15U);
   }
+
+  /* 这条路是"直接跳"，跨帧速度状态必须清掉，
+   * 否则回到闭环的第一帧会接着自检时的速度冲出去。 */
+  s_ear.vel1 = 0.0f;
+  s_ear.vel2 = 0.0f;
 }
+
+/* 本帧允许的最大速度：软启动期间从 EAR_SOFT_START_US 线性爬到 SERVO_SLEW_US
+ *
+ * 只在上电后的前 EAR_SOFT_START_MS 毫秒内起作用，之后恒等于 SERVO_SLEW_US，
+ * 平时完全没有开销地退化成"原来那条斜率限制"。
+ */
+static float SlewCap(void)
+{
+#if (EAR_SOFT_START_MS > 0U) && (EAR_SOFT_START_US < SERVO_SLEW_US)
+  {
+    const uint16_t full = (uint16_t)((uint32_t)EAR_SOFT_START_MS / IMU_PERIOD_MS);
+
+    if ((full != 0U) && (s_ear.up_frames < full))
+    {
+      return (float)EAR_SOFT_START_US
+           + ((float)SERVO_SLEW_US - (float)EAR_SOFT_START_US)
+             * ((float)s_ear.up_frames / (float)full);
+    }
+  }
+#endif
+  return (float)SERVO_SLEW_US;
+}
+
+#if (EAR_ACTION_MODE == EAR_ACTION_TRACK)
+/* 一路舵机的"软加速"步进
+ *
+ *   pos / vel  跨帧保存的当前脉宽与速度（us、us/帧）
+ *   target     目标脉宽
+ *   cap        本帧允许的最大速度（软启动期间小于 SERVO_SLEW_US）
+ *
+ * 三步：
+ *   1. 期望速度 = 剩余误差，夹到 ±cap          <- 这就是原来的斜率限制
+ *   2. 实际速度朝期望速度靠拢，每帧最多变 SERVO_ACC_US  <- 新增的加速度限制
+ *   3. 不许冲过目标：越过就停在目标上并把速度清零
+ *
+ * 第 3 步不能省。第 2 步让速度有了惯性，剩下的距离小于一帧行程时还会继续
+ * 按原速度走一帧，于是围着目标来回跳 1~2us，舵机就会发出细微的"滋滋"声。
+ * 卡在目标上之后速度归零，下一帧重新慢慢加，声音就没了。
+ */
+static void Servo_Slew(float *pos, float *vel, float target, float cap)
+{
+  float v_des = ClampF(target - *pos, -cap, cap);
+  float v;
+  float np;
+
+#if (SERVO_ACC_US > 0U) && (SERVO_ACC_US < SERVO_SLEW_US)
+  v = *vel + ClampF(v_des - *vel, -(float)SERVO_ACC_US, (float)SERVO_ACC_US);
+#else
+  v = v_des;
+#endif
+
+  np = *pos + v;
+
+  /* 跨过目标就停下（v_des 的符号就是"该往哪边去"） */
+  if (v_des >= 0.0f)
+  {
+    if (np > target) { np = target; v = 0.0f; }
+  }
+  else
+  {
+    if (np < target) { np = target; v = 0.0f; }
+  }
+
+  *pos = np;
+  *vel = v;
+}
+#endif /* EAR_ACTION_TRACK */
 
 /*==============================================================================
  *  姿态解算 + 混控输出
@@ -1309,6 +1438,32 @@ static void Ear_Update(float dt)
     s_ear.pitch_deg += (acc_pitch - s_ear.pitch_deg) * corr;   /* 加计：零点 */
     s_ear.pitch_deg  = ClampF(s_ear.pitch_deg,
                               -PITCH_LIMIT_DEG, PITCH_LIMIT_DEG);
+
+    /*------------------ 点头：取"动作量"而不是"角度" ----------------------
+     * 注意这里和 yaw 是同一个思路，不是"跟随头的倾角"。
+     *
+     * 做法：把每帧的角度**增量**累加起来，再叠一个泄漏。
+     *   低头   -> 增量是负的，累加值往负方向走，耳朵压下去
+     *   抬头回 -> 增量变正，把累加值抵回来，耳朵弹回去
+     *   停住   -> 增量为 0，泄漏把它拉回中位
+     *
+     * 于是"点头"这个动作本身变成一次脉冲：耳朵被踹一下，然后自己弹回中位，
+     * 不管头最后停在什么角度。这正是"点头时耳朵抖一抖"。
+     * 如果直接用 pitch_deg - pitch_ref（绝对倾角），那么低着头不动时
+     * 耳朵就会一直压着，看起来就是"不回中"。
+     *
+     * 增量取自互补滤波后的角度，而不是裸陀螺积分：
+     * 加速度计已经把零偏拉掉了，所以这个增量没有缓慢漂移，
+     * 泄漏就只需要负责"回中"，不必兼职纠偏。
+     *----------------------------------------------------------------------*/
+    {
+      float d = s_ear.pitch_deg - s_ear.pitch_prev;
+
+      s_ear.pitch_prev = s_ear.pitch_deg;
+      s_ear.pitch_tr  += d;
+      s_ear.pitch_tr  *= (1.0f - (dt / NOD_TR_TAU_S));
+      s_ear.pitch_tr   = ClampF(s_ear.pitch_tr, -NOD_TR_LIMIT_DEG, NOD_TR_LIMIT_DEG);
+    }
 
     /*====================== 偏航（摇头）====================================
      * 没有磁力计，加速度计也推不出"头朝哪边"，所以转头角只能对 gyro_z 积分。
@@ -1445,6 +1600,168 @@ static float SyncGate_Update(SyncGate_t *g, float target, float rate_dps, float 
 }
 #endif /* 有轴在用 AFTER_MOVE */
 
+/*==============================================================================
+ *  事件抖动（EAR_ACTION_MODE == EAR_ACTION_SHAKE）—— 当前使用
+ *
+ *  做了动作 -> 抖一下 -> 回中。没有稳态跟随，所以不可能"歪着不回来"。
+ *
+ *  抖动的波形是一个**阻尼谐振器**，递推式：
+ *      y[n] = k1·y[n-1] - k2·y[n-2]
+ *      k1 = 2r·cos(ω)，k2 = r²，ω = 2π / 每个来回的帧数
+ *  它的解析解就是 A·rⁿ·sin(nω)，也就是"幅度按 rⁿ 衰减的正弦波"。
+ *
+ *  为什么不用 sinf/expf 每帧现算：
+ *    1) 两个库函数会把几百字节的数学库拖进来，RAM 也不省
+ *    2) 递推每帧只要 2 次乘法 + 1 次减法，M0+ 没有 FPU 也毫无压力
+ *  精度问题可以不管：最多抖 3×25 = 75 帧，误差远小于 1us。
+ *
+ *  为什么"结束点正好在过零点"很重要：
+ *    n_max 取"来回数 × 每来回帧数"，这时 sin(2π·来回数) = 0，
+ *    波形自己就落在中位上。如果随便截断，最后一帧可能停在 ±300us，
+ *    强行归零就是舵机"啪"地弹一下 —— 观感全毁。
+ *============================================================================*/
+#if (EAR_ACTION_MODE == EAR_ACTION_SHAKE)
+
+typedef struct
+{
+  float    y1;        /* y[n-1] */
+  float    y2;        /* y[n-2] */
+  uint16_t n;         /* 已经走了多少帧 */
+  uint16_t n_max;     /* 总共走多少帧 = 来回数 × 每来回帧数 */
+} ShakeOsc_t;
+
+static float      s_shk_k1;       /* 2·r·cos(ω) */
+static float      s_shk_k2;       /* r² */
+static ShakeOsc_t s_shk_ear1;     /* CH1 = 左耳 */
+static ShakeOsc_t s_shk_ear2;     /* CH2 = 右耳 */
+static uint8_t    s_shk_arm_nod;  /* 1 = 可以接下一次抬头/低头 */
+static uint8_t    s_shk_arm_turn; /* 1 = 可以接下一次转头 */
+
+/* 递推系数算一次就够（cosf 只在上电调一次） */
+static void Shake_Setup(void)
+{
+  const float w = 6.2831853f / (float)SHAKE_PERIOD_FRAMES;
+
+  s_shk_k1 = 2.0f * SHAKE_DECAY_FRAME * cosf(w);
+  s_shk_k2 = SHAKE_DECAY_FRAME * SHAKE_DECAY_FRAME;
+
+  s_shk_arm_nod  = 1U;
+  s_shk_arm_turn = 1U;
+}
+
+/* 触发一次：amp 带符号（负号 = 往另一边抖） */
+static void Shake_Start(ShakeOsc_t *o, float amp, uint8_t cycles)
+{
+  o->y2    = 0.0f;
+  o->y1    = amp * sinf(6.2831853f / (float)SHAKE_PERIOD_FRAMES);
+  o->n     = 0U;
+  o->n_max = (uint16_t)((uint16_t)cycles * (uint16_t)SHAKE_PERIOD_FRAMES);
+}
+
+/* 每帧取一个值；抖完了返回 0（停在机械中位）
+ *
+ * 前两帧要特殊处理：这个递推式算的是 y[n]，而起始条件是
+ *   y[0] = 0（机械中位）、y[1] = A·sin(ω)（第一小步）
+ * 如果不特殊处理，第一帧就会直接吐出 y[2] ≈ 0.26·A，
+ * 等于给舵机一个 130us 的位置阶跃 —— 起步那一下又变成"啪"地弹出去，
+ * 前面辛苦做的平滑全白费。
+ *
+ * 收尾同理：n 一直走到 n_max 才停，此时 sin(2π·来回数) = 0，
+ * 输出正好落在中位上，不会残留一点偏移。 */
+static float Shake_Step(ShakeOsc_t *o)
+{
+  float y;
+
+  if (o->n > o->n_max) { return 0.0f; }
+
+  if (o->n == 0U)
+  {
+    o->n = 1U;
+    return 0.0f;              /* y[0]：从中位起步 */
+  }
+
+  if (o->n == 1U)
+  {
+    o->n = 2U;
+    return o->y1;             /* y[1]：第一小步 */
+  }
+
+  y     = (s_shk_k1 * o->y1) - (s_shk_k2 * o->y2);
+  o->y2 = o->y1;
+  o->y1 = y;
+  o->n++;
+
+  return y;
+}
+
+/* 触发检测：只认陀螺角速度，不认角度
+ *
+ * 用"超过 ON 阈值 -> 触发并缴械；回落到 OFF 阈值 -> 重新武装"这一对，
+ * 是为了让**一次**动作只抖**一次**。如果只看"超过阈值"，
+ * 低头下去是一个峰、抬头回来又是一个峰，中间必然穿过阈值以下，
+ * 于是会连续抖两次，看起来像程序抽风。
+ */
+static void Shake_Detect(void)
+{
+  float pr = fabsf(s_ear.pitch_rate);
+  float yr = fabsf(s_ear.yaw_rate);
+
+  /* 上电软启动期按比例缩小抖动幅度。
+   *
+   * 注意这里缩的是**幅度**，不是速度 —— 抖动波形本身就是平滑正弦，
+   * 速度峰值 64us/帧、加速度峰值 15us/帧²，都在安全范围内。
+   * 如果拿 Servo_Slew 去削它，会被"跨过目标清零速度"的逻辑切出台阶，
+   * 波形直接变锯齿，左右耳还会不对称。所以抖动这条路不走 Servo_Slew。 */
+  const float gain = SlewCap() / (float)SERVO_SLEW_US;
+
+  /*---- 抬头 / 低头：两耳同相、同幅 ----*/
+  if (pr > (float)SHAKE_PITCH_ON_DPS)
+  {
+    if (s_shk_arm_nod != 0U)
+    {
+      float dir = 1.0f;
+
+#if (SHAKE_NOD_FOLLOW_DIR != 0)
+      /* 抬头（pitch_rate > 0）往一边抖，低头往另一边抖 */
+      if (s_ear.pitch_rate < 0.0f) { dir = -1.0f; }
+#endif
+
+      Shake_Start(&s_shk_ear1, dir * SHAKE_AMP_NORM * gain, SHAKE_NOD_CYCLES);
+      Shake_Start(&s_shk_ear2, dir * SHAKE_AMP_NORM * gain, SHAKE_NOD_CYCLES);
+      s_shk_arm_nod = 0U;
+    }
+  }
+  else if (pr < (float)SHAKE_PITCH_OFF_DPS)
+  {
+    s_shk_arm_nod = 1U;
+  }
+
+  /*---- 转头：只抖"朝的那一侧" ----*/
+  if (yr > (float)SHAKE_YAW_ON_DPS)
+  {
+    if (s_shk_arm_turn != 0U)
+    {
+      if (s_ear.yaw_rate > 0.0f)
+      {
+        /* 左转（IMU_YAW_RATE_SIGN = +1）-> 左耳 = CH1 */
+        Shake_Start(&s_shk_ear1, SHAKE_AMP_NORM * gain, SHAKE_TURN_CYCLES);
+      }
+      else
+      {
+        /* 右转 -> 右耳 = CH2 */
+        Shake_Start(&s_shk_ear2, SHAKE_AMP_NORM * gain, SHAKE_TURN_CYCLES);
+      }
+      s_shk_arm_turn = 0U;
+    }
+  }
+  else if (yr < (float)SHAKE_YAW_OFF_DPS)
+  {
+    s_shk_arm_turn = 1U;
+  }
+}
+
+#endif /* EAR_ACTION_SHAKE */
+
 /* 把姿态换算成两路脉宽
  *
  * 两级映射，缺一不可：
@@ -1457,15 +1774,53 @@ static float SyncGate_Update(SyncGate_t *g, float target, float rate_dps, float 
  */
 static void Ear_Output(void)
 {
-  float nod, turn, cmd1, cmd2;
-  float target1, target2;
+  float cmd1 = 0.0f;
+  float cmd2 = 0.0f;
   float dir1 = (EAR_CH1_INVERT != 0) ? -1.0f : 1.0f;
   float dir2 = (EAR_CH2_INVERT != 0) ? -1.0f : 1.0f;
 
+#if (EAR_ACTION_MODE == EAR_ACTION_SHAKE)
+  /*----------------------------------------------------------------------
+   * 事件抖动：先看这一帧有没有"动作"，再由两个独立振荡器产生两路指令。
+   * 没有动作的时候两个振荡器都返回 0，两路都停在机械中位。
+   *
+   * 这条路**不过 Servo_Slew**。原因见 Shake_Detect() 里那段注释：
+   * 抖动波形本身已经是平滑正弦，硬套斜率/加速度限制只会被切成锯齿，
+   * 而且左右耳会被削得不一样（对称动作变成一大一小）。
+   * 上电保护改由 Shake_Gain 缩幅度完成，波形不失真。
+   *---------------------------------------------------------------------*/
+  Shake_Detect();
+  cmd1 = ClampF(Shake_Step(&s_shk_ear1), -1.0f, 1.0f);   /* CH1 = 左耳 */
+  cmd2 = ClampF(Shake_Step(&s_shk_ear2), -1.0f, 1.0f);   /* CH2 = 右耳 */
+
+  s_ear.out1 = (float)EAR_CH1_CENTER_US + (float)EAR_CH1_TRIM_US
+             + (dir1 * cmd1 * (float)EAR_CH1_SPAN_US);
+  s_ear.out2 = (float)EAR_CH2_CENTER_US + (float)EAR_CH2_TRIM_US
+             + (dir2 * cmd2 * (float)EAR_CH2_SPAN_US);
+
+  if (s_ear.up_frames < 0xFFFFU) { s_ear.up_frames++; }
+
+  Servo_Apply(s_ear.out1, s_ear.out2);
+
+  /* 给 SWD 观察用的镜像 */
+  g_ear_pose.pitch_tr   = s_ear.pitch_tr;
+  g_ear_pose.yaw_deg    = s_ear.yaw_deg;
+  g_ear_pose.pitch_rate = s_ear.pitch_rate;
+  g_ear_pose.yaw_rate   = s_ear.yaw_rate;
+  g_ear_pose.out1       = s_ear.out1;
+  g_ear_pose.out2       = s_ear.out2;
+  return;
+
+#else /* EAR_ACTION_TRACK：跟随角度 + Q 弹（旧行为，留作备用） */
+  float target1, target2;
+  {
+  float nod, turn;
+
   /* 1) 角度 -> 归一化指令（带死区与平滑）
-   *    俯仰用"相对上电姿态"的偏差，转头直接用累计角 */
-  nod  = ShapeNorm(s_ear.pitch_deg - s_ear.pitch_ref, NOD_DEADBAND_DEG, NOD_FULL_DEG);
-  turn = ShapeNorm(s_ear.yaw_deg, TURN_DEADBAND_DEG, TURN_FULL_DEG);
+   *    俯仰用"瞬态动作量"pitch_tr（点头一次 = 一个脉冲，自动回中）
+   *    转头用"漏积分角度"yaw_deg（转过去 -> 甩一下 -> 自己回正） */
+  nod  = ShapeNorm(s_ear.pitch_tr, NOD_DEADBAND_DEG, NOD_FULL_DEG);
+  turn = ShapeNorm(s_ear.yaw_deg,  TURN_DEADBAND_DEG, TURN_FULL_DEG);
 
   /* 2) 角速度前馈：快速抬头/转头时先给力，停住后自动回中，手感干脆 */
   nod  += ClampF(s_ear.pitch_rate * NOD_RATE_FF,  -NOD_RATE_FF_LIMIT,  NOD_RATE_FF_LIMIT);
@@ -1473,11 +1828,14 @@ static void Ear_Output(void)
 
   /* 3) 反应方式：让耳朵比头"慢半拍"
    *
-   * AFTER_MOVE 是默认：用陀螺看"头还在不在动"。
-   *   动 -> 舵机原地冻结（指令在变，输出不动）
-   *   连续静止 70ms -> 判定动作结束，之后用受限速度补到新位置
-   * 这样不管转得快还是慢，"头甩过去、耳朵愣一下再追"的观感都是恒定的。
-   * 注意冻结的只是舵机输出，姿态解算、回中、死区全都还是实时的。
+   * 两根轴的默认策略正好相反，原因见 app_ears.h 第 4b 节：
+   *
+   *   CH1 点头：pitch_tr 是"脉冲"，Q 弹弹簧本身就负责慢半拍，直通最自然。
+   *   CH2 转头：yaw_deg 是"会自己漏掉的角度"，再套一层"等头停下"的闸门，
+   *             追到的是一个正在消失的目标 —— 连续转头时闸门根本不放开，
+   *             表现就是"转头耳朵不动"。所以这里直通，延迟交给 TURN_SLEW_US。
+   *
+   * AFTER_MOVE 的代码还留着（宏一切就回来），只是不再默认启用。
    */
 #if (TURN_SYNC_MODE == EAR_SYNC_NONE)
   /* 直通：什么都不做 */
@@ -1545,6 +1903,7 @@ static void Ear_Output(void)
 #endif
   cmd1 = ClampF(cmd1, -1.0f, 1.0f);
   cmd2 = ClampF(cmd2, -1.0f, 1.0f);
+  }
 
   /* 6) 归一化 -> 脉宽 */
   target1 = (float)EAR_CH1_CENTER_US + (float)EAR_CH1_TRIM_US
@@ -1552,11 +1911,40 @@ static void Ear_Output(void)
   target2 = (float)EAR_CH2_CENTER_US + (float)EAR_CH2_TRIM_US
           + dir2 * cmd2 * (float)EAR_CH2_SPAN_US;
 
-  /* 7) 斜率限制：限制舵机转速，避免甩动与齿轮冲击 */
-  s_ear.out1 += ClampF(target1 - s_ear.out1, -(float)SERVO_SLEW_US, (float)SERVO_SLEW_US);
-  s_ear.out2 += ClampF(target2 - s_ear.out2, -(float)SERVO_SLEW_US, (float)SERVO_SLEW_US);
+  /* 7) 斜率限制 + 加速度限制：既限制舵机转速，也限制转速的上升率
+   *
+   * 原来这一行是"目标-当前 直接夹到 ±SERVO_SLEW_US"，速度是阶跃的：
+   * 指令一变，舵机就从静止瞬间到满速，电流尖峰全在这第一帧。
+   * 现在多一层加速度限制，速度斜坡上去，配合软启动的 cap，
+   * 上电初期和每次反向时的电流冲击都被摊平了。
+   * 细节见 Servo_Slew() / SlewCap() 和头文件第 5 节的说明。 */
+  {
+    float cap1 = SlewCap();
+    float cap2 = cap1;
+
+#if (EAR_ACTION_MODE == EAR_ACTION_TRACK) && (TURN_SLEW_US > 0U) && (TURN_SLEW_US < SERVO_SLEW_US)
+    /* 只有"跟随"模式才给 CH2 单独限速。
+     * 抖动模式下两只耳朵必须用同一个上限，否则右耳被削、左耳不被削，
+     * 对称抖动会变成"一大一小"，一眼就看出来。 */
+    if (cap2 > (float)TURN_SLEW_US) { cap2 = (float)TURN_SLEW_US; }
+#endif
+
+    Servo_Slew(&s_ear.out1, &s_ear.vel1, target1, cap1);
+    Servo_Slew(&s_ear.out2, &s_ear.vel2, target2, cap2);
+
+    if (s_ear.up_frames < 0xFFFFU) { s_ear.up_frames++; }
+  }
 
   Servo_Apply(s_ear.out1, s_ear.out2);
+
+  /* 给 SWD 观察用的镜像（24 字节，一次写完，PC 端读到的不会是半新半旧的一帧） */
+  g_ear_pose.pitch_tr   = s_ear.pitch_tr;
+  g_ear_pose.yaw_deg    = s_ear.yaw_deg;
+  g_ear_pose.pitch_rate = s_ear.pitch_rate;
+  g_ear_pose.yaw_rate   = s_ear.yaw_rate;
+  g_ear_pose.out1       = s_ear.out1;
+  g_ear_pose.out2       = s_ear.out2;
+#endif /* EAR_ACTION_MODE */
 }
 
 /*==============================================================================
@@ -1877,10 +2265,29 @@ static void Ear_ModeIndicate(uint8_t n)
   s_ear.hold = hold_backup;
 }
 
+/* 上电静默：启动 PWM 之前先等一会儿，让电池和滤波电容先充满。
+ *
+ * 这段时间两路信号脚是低电平，舵机内部不驱动电机 —— 不出力、不耗电、
+ * 也不会因为"上电瞬间就收到 1500us"而抢电流。等电源稳住了再启定时器，
+ * 上电浪涌和舵机找中位这两个峰值就不会叠在一起。
+ *
+ * 必须在 HAL_TIM_PWM_Start() 之前调用（main.c 里已经这么排了）。 */
+void Ear_PowerUpDelay(void)
+{
+#if (EAR_POWERUP_DELAY_MS > 0U)
+  Ear_DelayMs((uint32_t)EAR_POWERUP_DELAY_MS);
+#endif
+}
+
 void Ear_Init(void)
 {
   memset(&s_ear, 0, sizeof(s_ear));
   s_ear.imu_addr = IMU_ADDR_PRIMARY;
+
+#if (EAR_ACTION_MODE == EAR_ACTION_SHAKE)
+  /* 抖动波形的递推系数（cosf 只在这里算一次） */
+  Shake_Setup();
+#endif
 
   /* 先把两路拉到中位，避免上电瞬间舵机乱甩 */
   s_ear.out1 = (float)EAR_CH1_CENTER_US + (float)EAR_CH1_TRIM_US;
@@ -2009,8 +2416,9 @@ void Ear_Task(void)
     }
 
     /* 掉线期间让耳朵平滑回中，不要僵在最后一次动作上 */
-    s_ear.pitch_deg += (s_ear.pitch_ref - s_ear.pitch_deg) * 0.10f;
-    s_ear.yaw_deg *= 0.90f;
+    s_ear.pitch_tr   *= 0.90f;
+    s_ear.pitch_prev  = s_ear.pitch_deg;   /* 免得重连那一帧算出巨大的增量 */
+    s_ear.yaw_deg    *= 0.90f;
     s_ear.pitch_rate = 0.0f;
     s_ear.yaw_rate = 0.0f;
 
@@ -2044,7 +2452,9 @@ void Ear_GetState(EarState_t *st)
 {
   if (st == NULL) { return; }
 
-  st->pitch_deg      = s_ear.pitch_deg - s_ear.pitch_ref;
+  /* pitch_deg 字段给的是"当前驱动 CH1 的瞬态量"，和耳朵实际动作一致；
+   * 想看真实倾角就自己加 pitch_ref。 */
+  st->pitch_deg      = s_ear.pitch_tr;
   st->yaw_deg        = s_ear.yaw_deg;
   st->pitch_rate_dps = s_ear.pitch_rate;
   st->yaw_rate_dps   = s_ear.yaw_rate;
@@ -2068,6 +2478,8 @@ void Ear_SetPulseRaw(uint16_t us1, uint16_t us2)
   s_ear.hold = 1U;
   s_ear.out1 = (float)ClampUs((float)us1);
   s_ear.out2 = (float)ClampUs((float)us2);
+  s_ear.vel1 = 0.0f;   /* 手动跳过去的速度状态要清掉，否则回到闭环会带着冲 */
+  s_ear.vel2 = 0.0f;
   Servo_Apply(s_ear.out1, s_ear.out2);
 }
 
@@ -2183,7 +2595,7 @@ void Ear_PinHeartbeat(uint8_t cycles)
 
 /* 微秒级忙等。24MHz 下内层循环实测约 12 个周期，所以 1us 约 2 次循环。
  * 精度受中断影响会有一两个 us 的抖动，对舵机（10us 才 1.8°）完全够用。 */
-static void Ear_DelayUs(uint16_t us)
+EAR_TIMING_FIXED static void Ear_DelayUs(uint16_t us)
 {
   volatile uint32_t i;
   uint32_t loops = (uint32_t)us * 2U;

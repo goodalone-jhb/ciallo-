@@ -108,6 +108,12 @@ int main(void)
   Studio_TIM1_Init();
   Studio_I2C1_Init();
   /* USER CODE BEGIN 2 */
+  /* 缓启动第 1 步：先不给舵机信号，等电源稳定。
+   * 这段时间 PA0/PA1 是低电平，舵机不驱动电机，电池和滤波电容先充满，
+   * 避免"上电浪涌 + 舵机找中位"叠在一起把 5V 拉塌导致 MCU 欠压复位。
+   * 时长在 app_ears.h 的 EAR_POWERUP_DELAY_MS 里改（0 = 关掉）。 */
+  Ear_PowerUpDelay();
+
   /* 启动两路舵机 PWM（TIM1_CH1/CH2，50Hz） */
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
